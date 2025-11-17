@@ -1,10 +1,10 @@
 use dotenv::dotenv;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
-use tokio::time::sleep;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct ChatRequest {
     model: String,
     messages: Vec<Message>,
@@ -12,7 +12,7 @@ struct ChatRequest {
     temperature: f32,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct Message {
     role: String,
     content: String,
@@ -41,13 +41,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse()
         .expect("RPM must be a number");
 
-    println!("API测试开始");
+    let model = std::env::var("MODEL")
+        .expect("MODEL not found in .env");
+
+    println!("API高并发测试开始");
     println!("URL: {}", url);
+    println!("模型: {}", model);
     println!("RPM限制: {}", rpm);
 
-    let client = Client::new();
+    let client = Arc::new(Client::new());
+    let token = Arc::new(token);
+    let url = Arc::new(url);
+
     let request = ChatRequest {
-        model: "gemini-2.5-flash".to_string(),
+        model: model,
         messages: vec![
             Message {
                 role: "user".to_string(),
@@ -58,34 +65,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         temperature: 0.7,
     };
 
-    let delay = Duration::from_secs(60 / rpm as u64);
-    println!("请求间隔: {:?}", delay);
+    let success_count = Arc::new(Mutex::new(0));
+    let error_count = Arc::new(Mutex::new(0));
+    let start_time = Instant::now();
 
-    match send_request(&client, &url, &token, &request).await {
-        Ok(response) => {
-            println!("✅ 请求成功");
-            if let Some(choice) = response.choices.first() {
-                println!("回复: {}", choice.message.content);
+    println!("启动{}个并发任务...", rpm);
+    let mut tasks = Vec::new();
+
+    for i in 1..=rpm {
+        let client = client.clone();
+        let token = token.clone();
+        let url = url.clone();
+        let request = request.clone();
+        let success_count = success_count.clone();
+        let error_count = error_count.clone();
+
+        let task = tokio::spawn(async move {
+            match send_request(&client, &url, &token, &request).await {
+                Ok(_) => {
+                    let mut count = success_count.lock().unwrap();
+                    *count += 1;
+                    println!("任务{} ✅", i);
+                }
+                Err(_) => {
+                    let mut count = error_count.lock().unwrap();
+                    *count += 1;
+                    println!("任务{} ❌", i);
+                }
             }
-        }
-        Err(e) => {
-            println!("❌ 请求失败: {}", e);
-        }
+        });
+
+        tasks.push(task);
     }
 
-    // 测试RPM限制
-    println!("\n测试RPM限制...");
-    for i in 1..=3 {
-        println!("第{}次请求", i);
-        match send_request(&client, &url, &token, &request).await {
-            Ok(_) => println!("✅ 成功"),
-            Err(e) => println!("❌ 失败: {}", e),
-        }
-
-        if i < 3 {
-            sleep(delay).await;
-        }
+    for task in tasks {
+        task.await?;
     }
+
+    let duration = start_time.elapsed();
+    let success = *success_count.lock().unwrap();
+    let errors = *error_count.lock().unwrap();
+
+    println!("\n测试结果:");
+    println!("总请求数: {}", rpm);
+    println!("成功: {}", success);
+    println!("失败: {}", errors);
+    println!("耗时: {:.2}秒", duration.as_secs_f64());
+    let rpm_actual = success as f64 / duration.as_secs_f64() * 60.0;
+    println!("计算: {} ÷ {:.2} × 60 = {:.2}", success, duration.as_secs_f64(), rpm_actual);
+    println!("实际RPM: {:.2}", rpm_actual);
 
     Ok(())
 }
@@ -104,10 +132,13 @@ async fn send_request(
         .send()
         .await?;
 
-    if !response.status().is_success() {
-        return Err(format!("HTTP {}: {}", response.status(), response.text().await?).into());
+    let status = response.status();
+    let body = response.text().await?;
+
+    if !status.is_success() {
+        return Err(format!("HTTP {}: {}", status, body).into());
     }
 
-    let chat_response: ChatResponse = response.json().await?;
+    let chat_response: ChatResponse = serde_json::from_str(&body)?;
     Ok(chat_response)
 }
