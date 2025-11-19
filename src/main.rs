@@ -19,14 +19,14 @@ struct Message {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct ChatResponse {
-    #[warn(unused)]
     choices: Vec<Choice>,
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct Choice {
-    #[warn(unused)]
     message: Message,
 }
 
