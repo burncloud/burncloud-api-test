@@ -20,11 +20,13 @@ struct Message {
 
 #[derive(Deserialize)]
 struct ChatResponse {
+    #[warn(unused)]
     choices: Vec<Choice>,
 }
 
 #[derive(Deserialize)]
 struct Choice {
+    #[warn(unused)]
     message: Message,
 }
 
@@ -87,10 +89,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     *count += 1;
                     println!("任务{} ✅", i);
                 }
-                Err(_) => {
+                Err(e) => {
                     let mut count = error_count.lock().unwrap();
                     *count += 1;
-                    println!("任务{} ❌", i);
+                    let error_msg = format!("{}", e);
+                    println!("任务{} ❌ {}", i, error_msg);
                 }
             }
         });
