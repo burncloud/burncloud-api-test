@@ -69,6 +69,12 @@ struct TTFTMetrics {
     duration: Duration,
 }
 
+#[derive(Clone)]
+struct TPOTMetrics {
+    duration: Duration,
+    token_count: u32,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
@@ -95,7 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let prompt = std::env::var("PROMPT")
         .expect("PROMPT not found in .env");
 
-    println!("API高并发测试开始 ({})", if stream { "含TTFT测量" } else { "响应时间测量" });
+    println!("API高并发测试开始 ({})", if stream { "含TTFT+TPOT测量" } else { "响应时间测量" });
     println!("URL: {}", url);
     println!("模型: {}", model);
     println!("RPM限制: {}", rpm);
@@ -141,6 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let success_count = Arc::new(Mutex::new(0));
     let error_count = Arc::new(Mutex::new(0));
     let ttft_metrics = Arc::new(Mutex::new(Vec::new()));
+    let tpot_metrics = Arc::new(Mutex::new(Vec::new()));
     let start_time = Instant::now();
 
     println!("启动{}个并发任务...", rpm);
@@ -154,22 +161,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let success_count = success_count.clone();
         let error_count = error_count.clone();
         let ttft_metrics = ttft_metrics.clone();
+        let tpot_metrics = tpot_metrics.clone();
 
         let task = tokio::spawn(async move {
             match send_request_with_retry(&client, &url, &token, &request, 2).await {
-                Ok((ttft, content)) => {
+                Ok((ttft, tpot_opt, content)) => {
                     let mut count = success_count.lock().unwrap();
                     *count += 1;
-                    let mut metrics = ttft_metrics.lock().unwrap();
-                    metrics.push(TTFTMetrics { duration: ttft });
+                    let mut ttft_list = ttft_metrics.lock().unwrap();
+                    ttft_list.push(TTFTMetrics { duration: ttft });
+
+                    // 如果是流式响应且有TPOT数据，则收集TPOT指标
+                    if let Some(ref tpot) = tpot_opt {
+                        let mut tpot_list = tpot_metrics.lock().unwrap();
+                        tpot_list.push(tpot.clone());
+                    }
 
                     // 只显示前5个响应的内容，避免输出过多
                     if i <= 5 {
-                        let metric_name = if request.stream { "TTFT" } else { "响应时间" };
-                        println!("任务{} ✅ {}: {:?} | 回复: {}", i, metric_name, ttft, content);
+                        if request.stream {
+                            if let Some(ref tpot) = tpot_opt {
+                                println!("任务{} ✅ TTFT: {:?} | TPOT: {:?} ({:.1} tok/s) | 回复: {}",
+                                    i, ttft, tpot.duration, tpot.token_count as f64 / tpot.duration.as_secs_f64(), content);
+                            } else {
+                                println!("任务{} ✅ TTFT: {:?} | 回复: {}", i, ttft, content);
+                            }
+                        } else {
+                            println!("任务{} ✅ 响应时间: {:?} | 回复: {}", i, ttft, content);
+                        }
                     } else {
-                        let metric_name = if request.stream { "TTFT" } else { "响应时间" };
-                        println!("任务{} ✅ {}: {:?}", i, metric_name, ttft);
+                        if request.stream {
+                            if let Some(ref tpot) = tpot_opt {
+                                println!("任务{} ✅ TTFT: {:?} | TPOT: {:?} ({:.1} tok/s)",
+                                    i, ttft, tpot.duration, tpot.token_count as f64 / tpot.duration.as_secs_f64());
+                            } else {
+                                println!("任务{} ✅ TTFT: {:?}", i, ttft);
+                            }
+                        } else {
+                            println!("任务{} ✅ 响应时间: {:?}", i, ttft);
+                        }
                     }
                 }
                 Err(e) => {
@@ -192,6 +222,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let success = *success_count.lock().unwrap();
     let errors = *error_count.lock().unwrap();
     let metrics = ttft_metrics.lock().unwrap();
+    let tpot_list = tpot_metrics.lock().unwrap();
 
     println!("\n测试结果:");
     println!("总请求数: {}", rpm);
@@ -243,6 +274,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("\n🎯 性能评级: {}", performance_rating);
         println!("💡 连接池和超时优化已启用");
         println!("🔄 重试机制已启用 (最多2次重试)");
+
+        // TPOT统计 (仅对流式响应)
+        if stream && !tpot_list.is_empty() {
+            println!("\n📊 TPOT (Time Per Output Token) 性能统计:");
+            let total_tpot: Duration = tpot_list.iter().map(|t| t.duration).sum();
+            let avg_tpot = total_tpot / tpot_list.len() as u32;
+            let min_tpot = tpot_list.iter().map(|t| t.duration).min().unwrap();
+            let max_tpot = tpot_list.iter().map(|t| t.duration).max().unwrap();
+            let total_tokens: u32 = tpot_list.iter().map(|t| t.token_count).sum();
+
+            // 计算TPOT百分位数
+            let mut sorted_tpot_times: Vec<Duration> = tpot_list.iter().map(|t| t.duration).collect();
+            sorted_tpot_times.sort();
+            let p50_idx = sorted_tpot_times.len() * 50 / 100;
+            let p95_idx = sorted_tpot_times.len() * 95 / 100;
+            let p99_idx = sorted_tpot_times.len() * 99 / 100;
+
+            println!("成功TPOT样本数: {}", tpot_list.len());
+            println!("平均TPOT: {:?} ({:.2}ms)", avg_tpot, avg_tpot.as_millis());
+            println!("最小TPOT: {:?} ({:.2}ms)", min_tpot, min_tpot.as_millis());
+            println!("最大TPOT: {:?} ({:.2}ms)", max_tpot, max_tpot.as_millis());
+            println!("中位数TPOT(P50): {:?} ({:.2}ms)", sorted_tpot_times[p50_idx], sorted_tpot_times[p50_idx].as_millis());
+
+            if sorted_tpot_times.len() > 20 {
+                println!("P95 TPOT: {:?} ({:.2}ms)", sorted_tpot_times[p95_idx], sorted_tpot_times[p95_idx].as_millis());
+                println!("P99 TPOT: {:?} ({:.2}ms)", sorted_tpot_times[p99_idx], sorted_tpot_times[p99_idx].as_millis());
+            }
+
+            // Token吞吐量统计
+            let avg_tokens_per_second = tpot_list.iter()
+                .map(|t| t.token_count as f64 / t.duration.as_secs_f64())
+                .sum::<f64>() / tpot_list.len() as f64;
+
+            let total_tokens_per_second = total_tokens as f64 / duration.as_secs_f64();
+
+            println!("\n🚀 Token吞吐量统计:");
+            println!("总Token数: {}", total_tokens);
+            println!("平均每秒Token数: {:.1} tok/s", avg_tokens_per_second);
+            println!("整体吞吐量: {:.1} tok/s", total_tokens_per_second);
+
+            // TPOT性能评级
+            let avg_tpot_ms = avg_tpot.as_millis() as f64;
+            let tpot_rating = if avg_tpot_ms < 50.0 {
+                "🟢 优秀 (<50ms/token)"
+            } else if avg_tpot_ms < 100.0 {
+                "🟡 良好 (50-100ms/token)"
+            } else if avg_tpot_ms < 200.0 {
+                "🟠 一般 (100-200ms/token)"
+            } else {
+                "🔴 需要优化 (>200ms/token)"
+            };
+
+            println!("\n🎯 TPOT性能评级: {}", tpot_rating);
+        }
     }
 
     Ok(())
@@ -254,7 +339,7 @@ async fn send_request_with_retry(
     token: &str,
     request: &ChatRequest,
     max_retries: u32,
-) -> Result<(Duration, String), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(Duration, Option<TPOTMetrics>, String), Box<dyn std::error::Error + Send + Sync>> {
     let _start_time = Instant::now();
     let mut last_error: Option<Box<dyn std::error::Error + Send + Sync>> = None;
 
@@ -268,12 +353,12 @@ async fn send_request_with_retry(
         };
 
         match result {
-            Ok((response_time, content)) => {
+            Ok((response_time, tpot_opt, content)) => {
                 // 记录重试信息
                 if attempt > 0 {
                     println!("  🔄 重试{}次后成功，总耗时: {:?}", attempt, request_start.elapsed());
                 }
-                return Ok((response_time, content));
+                return Ok((response_time, tpot_opt, content));
             }
             Err(e) => {
                 last_error = Some(e);
@@ -294,7 +379,7 @@ async fn send_request_stream_once(
     url: &str,
     token: &str,
     request: &ChatRequest,
-) -> Result<(Duration, String), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(Duration, Option<TPOTMetrics>, String), Box<dyn std::error::Error + Send + Sync>> {
     let start_time = Instant::now();
     let response = client
         .post(url)
@@ -321,6 +406,11 @@ async fn send_request_stream_once(
     let mut buffer = Vec::new();
     let mut complete_response = String::new();
 
+    // TPOT计算相关变量
+    let mut tpot_start_time = Instant::now();
+    let mut token_count = 0u32;
+    let mut first_token_received = false;
+
     // 优化的流处理：更大的缓冲区，更快的首字检测
     while let Some(chunk_result) = byte_stream.next().await {
         match chunk_result {
@@ -343,6 +433,30 @@ async fn send_request_stream_once(
 
                 // 收集响应内容
                 complete_response.push_str(&chunk_str);
+
+                // TPOT计算：解析token并计数
+                let lines: Vec<&str> = chunk_str.lines().collect();
+                for line in lines {
+                    if line.starts_with("data: ") && !line.contains("[DONE]") {
+                        let data_str = &line[6..]; // 移除"data: "
+
+                        // 尝试解析JSON数据
+                        if let Ok(stream_response) = serde_json::from_str::<StreamResponse>(data_str) {
+                            for choice in stream_response.choices {
+                                if let Some(content) = choice.delta.content {
+                                    // 如果是第一个有内容的token，开始TPOT计时
+                                    if !first_token_received && !content.trim().is_empty() {
+                                        tpot_start_time = Instant::now();
+                                        first_token_received = true;
+                                    }
+
+                                    // 计算token数量（简单按字符数估算，可以更精确）
+                                    token_count += content.chars().count() as u32;
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // 检查是否收到结束标记
                 if complete_response.contains("[DONE]") {
@@ -367,7 +481,18 @@ async fn send_request_stream_once(
     // 解析响应内容，提取实际的消息内容
     let extracted_content = extract_message_content(&complete_response);
 
-    Ok((ttft, extracted_content))
+    // 计算TPOT指标
+    let tpot_metrics = if first_token_received && token_count > 0 {
+        let tpot_duration = tpot_start_time.elapsed();
+        Some(TPOTMetrics {
+            duration: tpot_duration,
+            token_count: token_count,
+        })
+    } else {
+        None
+    };
+
+    Ok((ttft, tpot_metrics, extracted_content))
 }
 
 async fn send_request_non_stream_once(
@@ -375,7 +500,7 @@ async fn send_request_non_stream_once(
     url: &str,
     token: &str,
     request: &ChatRequest,
-) -> Result<(Duration, String), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(Duration, Option<TPOTMetrics>, String), Box<dyn std::error::Error + Send + Sync>> {
     let start_time = Instant::now();
     let response = client
         .post(url)
@@ -401,7 +526,7 @@ async fn send_request_non_stream_once(
     // 解析非流式响应
     if let Ok(chat_response) = serde_json::from_str::<NonStreamResponse>(&response_text) {
         if let Some(choice) = chat_response.choices.first() {
-            Ok((response_time, choice.message.content.clone()))
+            Ok((response_time, None, choice.message.content.clone()))
         } else {
             Err("No choices in response".into())
         }
