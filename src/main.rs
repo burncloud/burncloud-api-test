@@ -97,7 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|_| "2025-01-01-preview".to_string());
 
             // Azure OpenAI的URL格式: https://your-resource.openai.azure.com/openai/deployments/{deployment-name}/chat/completions?api-version={api-version}
-            let azure_url = format!("{}openai/deployments/{}/chat/completions?api-version={}",
+            let azure_url = format!("{}/openai/deployments/{}/chat/completions?api-version={}",
                 endpoint.trim_end_matches('/'), deployment_name, api_version);
 
             (api_key, azure_url, deployment_name)
