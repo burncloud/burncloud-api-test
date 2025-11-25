@@ -79,17 +79,46 @@ struct TPOTMetrics {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
 
-    let token = std::env::var("API_TOKEN")
-        .expect("API_TOKEN not found in .env");
-    let url = std::env::var("API_URL")
-        .expect("API_URL not found in .env");
+    // 读取API提供商配置
+    let provider = std::env::var("PROVIDER")
+        .unwrap_or_else(|_| "openai".to_string())
+        .to_lowercase();
+
+    // 根据提供商配置读取相应的参数
+    let (token, url, model) = match provider.as_str() {
+        "azure" => {
+            let api_key = std::env::var("AZURE_OPENAI_API_KEY")
+                .expect("AZURE_OPENAI_API_KEY not found in .env when PROVIDER=azure");
+            let endpoint = std::env::var("AZURE_OPENAI_ENDPOINT")
+                .expect("AZURE_OPENAI_ENDPOINT not found in .env when PROVIDER=azure");
+            let deployment_name = std::env::var("AZURE_OPENAI_DEPLOYMENT_NAME")
+                .expect("AZURE_OPENAI_DEPLOYMENT_NAME not found in .env when PROVIDER=azure");
+            let api_version = std::env::var("AZURE_OPENAI_API_VERSION")
+                .unwrap_or_else(|_| "2025-01-01-preview".to_string());
+
+            // Azure OpenAI的URL格式: https://your-resource.openai.azure.com/openai/deployments/{deployment-name}/chat/completions?api-version={api-version}
+            let azure_url = format!("{}openai/deployments/{}/chat/completions?api-version={}",
+                endpoint.trim_end_matches('/'), deployment_name, api_version);
+
+            (api_key, azure_url, deployment_name)
+        }
+        "openai" | _ => {
+            let api_token = std::env::var("API_TOKEN")
+                .expect("API_TOKEN not found in .env when PROVIDER=openai");
+            let api_url = std::env::var("API_URL")
+                .expect("API_URL not found in .env when PROVIDER=openai");
+            let model_name = std::env::var("MODEL")
+                .expect("MODEL not found in .env");
+
+            (api_token, api_url, model_name)
+        }
+    };
+
     let rpm: u32 = std::env::var("RPM")
         .expect("RPM not found in .env")
         .parse()
         .expect("RPM must be a number");
 
-    let model = std::env::var("MODEL")
-        .expect("MODEL not found in .env");
     let max_tokens: u32 = std::env::var("MAX_TOKENS")
         .expect("MAX_TOKENS not found in .env")
         .parse()
@@ -102,6 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("PROMPT not found in .env");
 
     println!("API高并发测试开始 ({})", if stream { "含TTFT+TPOT测量" } else { "响应时间测量" });
+    println!("提供商: {}", if provider == "azure" { "Azure OpenAI" } else { "OpenAI" });
     println!("URL: {}", url);
     println!("模型: {}", model);
     println!("RPM限制: {}", rpm);
@@ -127,8 +157,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let token = Arc::new(token);
     let url = Arc::new(url);
 
+    // Azure OpenAI不需要在请求体中指定model，因为model已经在URL中指定
+    let request_model = if provider == "azure" { "".to_string() } else { model.clone() };
+
     let request = ChatRequest {
-        model: model,
+        model: request_model,
         messages: vec![
             Message {
                 role: "system".to_string(),
@@ -381,12 +414,23 @@ async fn send_request_stream_once(
     request: &ChatRequest,
 ) -> Result<(Duration, Option<TPOTMetrics>, String), Box<dyn std::error::Error + Send + Sync>> {
     let start_time = Instant::now();
-    let response = client
+
+    // 根据URL判断是否为Azure OpenAI，设置不同的认证头
+    let is_azure = url.contains("openai.azure.com") || url.contains("api-version=");
+
+    let mut req_builder = client
         .post(url)
-        .header("Authorization", format!("Bearer {}", token))
         .header("Content-Type", "application/json")
         .header("Connection", "keep-alive")
-        .header("Accept", "text/event-stream")
+        .header("Accept", "text/event-stream");
+
+    if is_azure {
+        req_builder = req_builder.header("api-key", token);
+    } else {
+        req_builder = req_builder.header("Authorization", format!("Bearer {}", token));
+    }
+
+    let response = req_builder
         .json(request)
         .timeout(Duration::from_secs(25)) // 请求级别超时
         .send()
@@ -502,11 +546,22 @@ async fn send_request_non_stream_once(
     request: &ChatRequest,
 ) -> Result<(Duration, Option<TPOTMetrics>, String), Box<dyn std::error::Error + Send + Sync>> {
     let start_time = Instant::now();
-    let response = client
+
+    // 根据URL判断是否为Azure OpenAI，设置不同的认证头
+    let is_azure = url.contains("openai.azure.com") || url.contains("api-version=");
+
+    let mut req_builder = client
         .post(url)
-        .header("Authorization", format!("Bearer {}", token))
         .header("Content-Type", "application/json")
-        .header("Connection", "keep-alive")
+        .header("Connection", "keep-alive");
+
+    if is_azure {
+        req_builder = req_builder.header("api-key", token);
+    } else {
+        req_builder = req_builder.header("Authorization", format!("Bearer {}", token));
+    }
+
+    let response = req_builder
         .json(request)
         .timeout(Duration::from_secs(25)) // 请求级别超时
         .send()
