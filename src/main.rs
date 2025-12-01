@@ -50,6 +50,71 @@ struct StreamResponse {
     choices: Vec<StreamChoice>,
 }
 
+// Claude v1/messages API structures
+#[derive(Serialize, Clone)]
+struct ClaudeMessage {
+    role: String,
+    content: Vec<ClaudeContent>,
+}
+
+#[derive(Serialize, Clone)]
+struct ClaudeContent {
+    r#type: String,
+    text: String,
+}
+
+#[derive(Serialize, Clone)]
+struct ClaudeRequest {
+    model: String,
+    messages: Vec<ClaudeMessage>,
+    max_tokens: u32,
+    temperature: f32,
+    stream: bool,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct ClaudeResponse {
+    id: String,
+    r#type: String,
+    role: String,
+    content: Vec<ClaudeContentResponse>,
+    model: String,
+    stop_reason: Option<String>,
+    stop_sequence: Option<String>,
+    usage: ClaudeUsage,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct ClaudeContentResponse {
+    r#type: String,
+    text: String,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct ClaudeUsage {
+    input_tokens: u32,
+    output_tokens: u32,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct ClaudeStreamResponse {
+    r#type: String,
+    index: Option<u32>,
+    delta: Option<ClaudeDelta>,
+    usage: Option<ClaudeUsage>,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct ClaudeDelta {
+    r#type: String,
+    text: String,
+}
+
 // 非流式响应结构
 #[derive(Deserialize)]
 #[allow(dead_code)]
@@ -102,6 +167,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             (api_key, azure_url, deployment_name)
         }
+        "claude" => {
+            let api_key = std::env::var("AZURE_CLAUDE_API_KEY")
+                .expect("AZURE_CLAUDE_API_KEY not found in .env when PROVIDER=claude");
+            let endpoint = std::env::var("AZURE_CLAUDE_ENDPOINT")
+                .expect("AZURE_CLAUDE_ENDPOINT not found in .env when PROVIDER=claude");
+            let deployment_name = std::env::var("AZURE_CLAUDE_DEPLOYMENT_NAME")
+                .expect("AZURE_CLAUDE_DEPLOYMENT_NAME not found in .env when PROVIDER=claude");
+            let api_version = std::env::var("AZURE_CLAUDE_API_VERSION")
+                .unwrap_or_else(|_| "2025-01-01-preview".to_string());
+
+            // Azure Claude的URL格式: https://your-resource.openai.azure.com/openai/deployments/{deployment-name}/messages?api-version={api-version}
+            let claude_url = format!("{}/openai/deployments/{}/messages?api-version={}",
+                endpoint.trim_end_matches('/'), deployment_name, api_version);
+
+            (api_key, claude_url, deployment_name)
+        }
         "openai" | _ => {
             let api_token = std::env::var("API_TOKEN")
                 .expect("API_TOKEN not found in .env when PROVIDER=openai");
@@ -131,7 +212,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("PROMPT not found in .env");
 
     println!("API高并发测试开始 ({})", if stream { "含TTFT+TPOT测量" } else { "响应时间测量" });
-    println!("提供商: {}", if provider == "azure" { "Azure OpenAI" } else { "OpenAI" });
+    println!("提供商: {}", match provider.as_str() {
+        "azure" => "Azure OpenAI (GPT)",
+        "claude" => "Azure Claude (Anthropic)",
+        _ => "OpenAI"
+    });
     println!("URL: {}", url);
     println!("模型: {}", model);
     println!("RPM限制: {}", rpm);
@@ -157,24 +242,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let token = Arc::new(token);
     let url = Arc::new(url);
 
-    // Azure OpenAI不需要在请求体中指定model，因为model已经在URL中指定
-    let request_model = if provider == "azure" { "".to_string() } else { model.clone() };
-
-    let request = ChatRequest {
-        model: request_model,
-        messages: vec![
-            Message {
-                role: "system".to_string(),
-                content: prompt,
-            },
-            Message {
-                role: "user".to_string(),
-                content: "hi".to_string(),
-            }
-        ],
-        max_tokens: max_tokens,
-        temperature: 0.7,
-        stream: stream,
+    // 根据提供商创建不同的请求格式
+    let request_data = if provider == "claude" {
+        // Claude v1/messages格式
+        let claude_request = ClaudeRequest {
+            model: model.clone(),
+            messages: vec![
+                ClaudeMessage {
+                    role: "user".to_string(),
+                    content: vec![
+                        ClaudeContent {
+                            r#type: "text".to_string(),
+                            text: format!("{}\n\nhi", prompt),
+                        }
+                    ],
+                }
+            ],
+            max_tokens: max_tokens,
+            temperature: 0.7,
+            stream: stream,
+        };
+        serde_json::to_value(claude_request).expect("Failed to serialize Claude request")
+    } else {
+        // OpenAI/Azure OpenAI格式
+        let request_model = if provider == "azure" { "".to_string() } else { model.clone() };
+        let chat_request = ChatRequest {
+            model: request_model,
+            messages: vec![
+                Message {
+                    role: "system".to_string(),
+                    content: prompt,
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: "hi".to_string(),
+                }
+            ],
+            max_tokens: max_tokens,
+            temperature: 0.7,
+            stream: stream,
+        };
+        serde_json::to_value(chat_request).expect("Failed to serialize ChatRequest")
     };
 
     let success_count = Arc::new(Mutex::new(0));
@@ -190,14 +298,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let client = client.clone();
         let token = token.clone();
         let url = url.clone();
-        let request = request.clone();
+        let request_data = request_data.clone();
         let success_count = success_count.clone();
         let error_count = error_count.clone();
         let ttft_metrics = ttft_metrics.clone();
         let tpot_metrics = tpot_metrics.clone();
+        let provider = provider.clone();
 
         let task = tokio::spawn(async move {
-            match send_request_with_retry(&client, &url, &token, &request, 2).await {
+            match send_request_with_retry(&client, &url, &token, &request_data, &provider, 2).await {
                 Ok((ttft, tpot_opt, content)) => {
                     let mut count = success_count.lock().unwrap();
                     *count += 1;
@@ -212,7 +321,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     // 只显示前5个响应的内容，避免输出过多
                     if i <= 5 {
-                        if request.stream {
+                        if stream {
                             if let Some(ref tpot) = tpot_opt {
                                 println!("任务{} ✅ TTFT: {:?} | TPOT: {:?} ({:.1} tok/s) | 回复: {}",
                                     i, ttft, tpot.duration, tpot.token_count as f64 / tpot.duration.as_secs_f64(), content);
@@ -223,7 +332,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             println!("任务{} ✅ 响应时间: {:?} | 回复: {}", i, ttft, content);
                         }
                     } else {
-                        if request.stream {
+                        if stream {
                             if let Some(ref tpot) = tpot_opt {
                                 println!("任务{} ✅ TTFT: {:?} | TPOT: {:?} ({:.1} tok/s)",
                                     i, ttft, tpot.duration, tpot.token_count as f64 / tpot.duration.as_secs_f64());
@@ -370,7 +479,8 @@ async fn send_request_with_retry(
     client: &Client,
     url: &str,
     token: &str,
-    request: &ChatRequest,
+    request: &serde_json::Value,
+    provider: &str,
     max_retries: u32,
 ) -> Result<(Duration, Option<TPOTMetrics>, String), Box<dyn std::error::Error + Send + Sync>> {
     let _start_time = Instant::now();
@@ -379,10 +489,18 @@ async fn send_request_with_retry(
     for attempt in 0..=max_retries {
         let request_start = Instant::now();
 
-        let result = if request.stream {
-            send_request_stream_once(client, url, token, request).await
+        let result = if provider == "claude" {
+            if request.get("stream").and_then(|v| v.as_bool()).unwrap_or(false) {
+                send_claude_request_stream_once(client, url, token, request).await
+            } else {
+                send_claude_request_non_stream_once(client, url, token, request).await
+            }
         } else {
-            send_request_non_stream_once(client, url, token, request).await
+            if request.get("stream").and_then(|v| v.as_bool()).unwrap_or(false) {
+                send_request_stream_once(client, url, token, request).await
+            } else {
+                send_request_non_stream_once(client, url, token, request).await
+            }
         };
 
         match result {
@@ -411,7 +529,7 @@ async fn send_request_stream_once(
     client: &Client,
     url: &str,
     token: &str,
-    request: &ChatRequest,
+    request: &serde_json::Value,
 ) -> Result<(Duration, Option<TPOTMetrics>, String), Box<dyn std::error::Error + Send + Sync>> {
     let start_time = Instant::now();
 
@@ -543,7 +661,7 @@ async fn send_request_non_stream_once(
     client: &Client,
     url: &str,
     token: &str,
-    request: &ChatRequest,
+    request: &serde_json::Value,
 ) -> Result<(Duration, Option<TPOTMetrics>, String), Box<dyn std::error::Error + Send + Sync>> {
     let start_time = Instant::now();
 
@@ -615,6 +733,201 @@ fn extract_message_content(sse_data: &str) -> String {
                 for choice in stream_response.choices {
                     if let Some(content) = choice.delta.content {
                         content_parts.push(content);
+                    }
+                }
+            }
+        }
+    }
+
+    // 合并所有内容部分
+    content_parts.join("")
+}
+
+// Claude-specific request functions
+async fn send_claude_request_stream_once(
+    client: &Client,
+    url: &str,
+    token: &str,
+    request: &serde_json::Value,
+) -> Result<(Duration, Option<TPOTMetrics>, String), Box<dyn std::error::Error + Send + Sync>> {
+    let start_time = Instant::now();
+
+    let response = client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header("api-key", token)
+        .header("Accept", "text/event-stream")
+        .json(request)
+        .timeout(Duration::from_secs(25))
+        .send()
+        .await?;
+
+    let status = response.status();
+
+    if !status.is_success() {
+        let body = response.text().await?;
+        return Err(format!("HTTP {}: {}", status, body).into());
+    }
+
+    // 处理Claude的流式响应
+    let mut byte_stream = response.bytes_stream();
+    let mut first_chunk_received = false;
+    let mut ttft = Duration::ZERO;
+    let mut buffer = Vec::new();
+    let mut complete_response = String::new();
+
+    // TPOT计算相关变量
+    let mut tpot_start_time = Instant::now();
+    let mut token_count = 0u32;
+    let mut first_token_received = false;
+
+    while let Some(chunk_result) = byte_stream.next().await {
+        match chunk_result {
+            Ok(chunk) => {
+                let chunk_str = String::from_utf8_lossy(&chunk);
+                buffer.extend_from_slice(&chunk);
+
+                // 检查是否收到有效的SSE数据
+                if !first_chunk_received {
+                    let buffer_str = String::from_utf8_lossy(&buffer);
+
+                    if buffer_str.contains("data: ") &&
+                       !buffer_str.contains("[DONE]") &&
+                       buffer_str.len() > 12 {
+                        ttft = start_time.elapsed();
+                        first_chunk_received = true;
+                    }
+                }
+
+                // 收集响应内容
+                complete_response.push_str(&chunk_str);
+
+                // TPOT计算：解析Claude的token并计数
+                let lines: Vec<&str> = chunk_str.lines().collect();
+                for line in lines {
+                    if line.starts_with("data: ") && !line.contains("[DONE]") {
+                        let data_str = &line[6..]; // 移除"data: "
+
+                        // 尝试解析Claude流式响应JSON数据
+                        if let Ok(claude_stream) = serde_json::from_str::<ClaudeStreamResponse>(data_str) {
+                            if let Some(delta) = claude_stream.delta {
+                                if !delta.text.trim().is_empty() {
+                                    // 如果是第一个有内容的token，开始TPOT计时
+                                    if !first_token_received {
+                                        tpot_start_time = Instant::now();
+                                        first_token_received = true;
+                                    }
+
+                                    // 计算token数量（简单按字符数估算）
+                                    token_count += delta.text.chars().count() as u32;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 检查是否收到结束标记
+                if complete_response.contains("[DONE]") {
+                    break;
+                }
+            }
+            Err(e) => {
+                return Err(format!("Claude stream error: {}", e).into());
+            }
+        }
+
+        // 防止无限等待
+        if start_time.elapsed() > Duration::from_secs(20) {
+            break;
+        }
+    }
+
+    if !first_chunk_received {
+        return Err("No data received from Claude stream".into());
+    }
+
+    // 解析Claude响应内容
+    let extracted_content = extract_claude_message_content(&complete_response);
+
+    // 计算TPOT指标
+    let tpot_metrics = if first_token_received && token_count > 0 {
+        let tpot_duration = tpot_start_time.elapsed();
+        Some(TPOTMetrics {
+            duration: tpot_duration,
+            token_count: token_count,
+        })
+    } else {
+        None
+    };
+
+    Ok((ttft, tpot_metrics, extracted_content))
+}
+
+async fn send_claude_request_non_stream_once(
+    client: &Client,
+    url: &str,
+    token: &str,
+    request: &serde_json::Value,
+) -> Result<(Duration, Option<TPOTMetrics>, String), Box<dyn std::error::Error + Send + Sync>> {
+    let start_time = Instant::now();
+
+    let response = client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header("api-key", token)
+        .json(request)
+        .timeout(Duration::from_secs(25))
+        .send()
+        .await?;
+
+    let status = response.status();
+
+    if !status.is_success() {
+        let body = response.text().await?;
+        return Err(format!("HTTP {}: {}", status, body).into());
+    }
+
+    // 非流式响应，等待完整响应
+    let response_text = response.text().await?;
+    let response_time = start_time.elapsed();
+
+    // 解析Claude非流式响应
+    if let Ok(claude_response) = serde_json::from_str::<ClaudeResponse>(&response_text) {
+        let content: String = claude_response.content
+            .iter()
+            .filter_map(|c| c.text.clone().into())
+            .collect();
+        Ok((response_time, None, content))
+    } else {
+        Err("Failed to parse Claude non-stream response".into())
+    }
+}
+
+fn extract_claude_message_content(sse_data: &str) -> String {
+    let mut content_parts = Vec::new();
+
+    // 按行分割SSE数据
+    for line in sse_data.lines() {
+        // 跳过空行和注释
+        if line.trim().is_empty() || line.starts_with(':') {
+            continue;
+        }
+
+        // 查找data:行
+        if line.starts_with("data: ") {
+            let data_str = &line[6..]; // 移除"data: "
+
+            // 跳过[DONE]标记
+            if data_str.trim() == "[DONE]" {
+                continue;
+            }
+
+            // 解析Claude流式响应JSON数据
+            if let Ok(claude_stream) = serde_json::from_str::<ClaudeStreamResponse>(data_str) {
+                // 提取内容
+                if let Some(delta) = claude_stream.delta {
+                    if !delta.text.trim().is_empty() {
+                        content_parts.push(delta.text);
                     }
                 }
             }
