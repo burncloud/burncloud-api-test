@@ -194,6 +194,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             (api_key, claude_url, deployment_name)
         }
+        "anthropic" => {
+            let api_key = std::env::var("ANTHROPIC_API_KEY")
+                .expect("ANTHROPIC_API_KEY not found in .env when PROVIDER=anthropic");
+            let base_url = std::env::var("TEST_ANTHROPIC_BASE_URL")
+                .unwrap_or_else(|_| "https://api.anthropic.com/v1/messages".to_string());
+            let model_name = std::env::var("MODEL")
+                .unwrap_or_else(|_| std::env::var("ANTHROPIC_MODEL").expect("MODEL or ANTHROPIC_MODEL must be set"));
+            
+            (api_key, base_url, model_name)
+        }
         "openai" | _ => {
             let api_token = std::env::var("API_TOKEN")
                 .expect("API_TOKEN not found in .env when PROVIDER=openai");
@@ -259,7 +269,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Token: {}...", &token[..std::cmp::min(10, token.len())]);
 
     // 根据提供商创建不同的请求格式
-    let request_data = if provider == "claude" {
+    let request_data = if provider == "claude" || provider == "anthropic" {
         // Claude v1/messages格式 - 修复system角色问题
         let claude_request = ClaudeRequest {
             model: model.clone(),
@@ -283,9 +293,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         // OpenAI/Azure OpenAI格式
         let request_model = if provider == "azure" { "".to_string() } else { model.clone() };
-        let chat_request = ChatRequest {
-            model: request_model,
-            messages: vec![
+        
+        // 兼容性处理: 如果模型名包含 "claude"，且正在使用 OpenAI 协议 (如 New-API 中转)
+        // 最好不要发送 "system" role，因为部分中转可能会直接透传给 Claude 导致 "Unexpected role system" 错误。
+        // 解决方案是将 system prompt 合并到 user message 中。
+        let messages = if model.to_lowercase().contains("claude") {
+            vec![
+                Message {
+                    role: "user".to_string(),
+                    content: format!("{}\n\nhi", prompt),
+                }
+            ]
+        } else {
+            vec![
                 Message {
                     role: "system".to_string(),
                     content: prompt,
@@ -294,7 +314,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     role: "user".to_string(),
                     content: "hi".to_string(),
                 }
-            ],
+            ]
+        };
+
+        let chat_request = ChatRequest {
+            model: request_model,
+            messages: messages,
             max_tokens: max_tokens,
             temperature: 0.7,
             stream: stream,
@@ -506,11 +531,11 @@ async fn send_request_with_retry(
     for attempt in 0..=max_retries {
         let request_start = Instant::now();
 
-        let result = if provider == "claude" {
+        let result = if provider == "claude" || provider == "anthropic" {
             if request.get("stream").and_then(|v| v.as_bool()).unwrap_or(false) {
-                send_claude_request_stream_once(client, url, token, request).await
+                send_claude_request_stream_once(client, url, token, request, provider).await
             } else {
-                send_claude_request_non_stream_once(client, url, token, request).await
+                send_claude_request_non_stream_once(client, url, token, request, provider).await
             }
         } else {
             if request.get("stream").and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -567,6 +592,13 @@ async fn send_request_stream_once(
         req_builder = req_builder.header("api-key", token);
     } else {
         req_builder = req_builder.header("Authorization", format!("Bearer {}", token));
+    }
+
+    // 修复: 如果模型是 Claude，即使是 OpenAI 兼容接口，部分中转也需要 anthropic-version 头
+    if let Some(model) = request.get("model").and_then(|m| m.as_str()) {
+        if model.to_lowercase().contains("claude") {
+            req_builder = req_builder.header("anthropic-version", "2023-06-01");
+        }
     }
 
     let response = req_builder
@@ -704,6 +736,13 @@ async fn send_request_non_stream_once(
         req_builder = req_builder.header("Authorization", format!("Bearer {}", token));
     }
 
+    // 修复: 如果模型是 Claude，即使是 OpenAI 兼容接口，部分中转也需要 anthropic-version 头
+    if let Some(model) = request.get("model").and_then(|m| m.as_str()) {
+        if model.to_lowercase().contains("claude") {
+            req_builder = req_builder.header("anthropic-version", "2023-06-01");
+        }
+    }
+
     let response = req_builder
         .json(request)
         .timeout(Duration::from_secs(25)) // 请求级别超时
@@ -774,6 +813,7 @@ async fn send_claude_request_stream_once(
     url: &str,
     token: &str,
     request: &serde_json::Value,
+    provider: &str,
 ) -> Result<(Duration, Option<TPOTMetrics>, String), Box<dyn std::error::Error + Send + Sync>> {
     let start_time = Instant::now();
 
@@ -782,11 +822,21 @@ async fn send_claude_request_stream_once(
         .header("Content-Type", "application/json")
         .header("Accept", "text/event-stream");
 
-    // Use Bearer token for non-Azure endpoints (like New-API or native Anthropic)
-    if url.contains("openai.azure.com") {
-        req_builder = req_builder.header("api-key", token);
+    if provider == "anthropic" {
+        // New-API 中转通常希望使用 Authorization 头进行鉴权，
+        // 但同时也需要 anthropic-version 头来满足 upstream 的要求。
+        // 我们不再发送 x-api-key，以免 token 被错误地透传给 upstream。
+        req_builder = req_builder
+            .header("Authorization", format!("Bearer {}", token))
+            .header("anthropic-version", "2023-06-01");
     } else {
-        req_builder = req_builder.header("Authorization", format!("Bearer {}", token));
+        // Azure Claude 或其他兼容接口
+        // Use Bearer token for non-Azure endpoints (like New-API or native Anthropic)
+        if url.contains("openai.azure.com") {
+            req_builder = req_builder.header("api-key", token);
+        } else {
+            req_builder = req_builder.header("Authorization", format!("Bearer {}", token));
+        }
     }
 
     let response = req_builder
@@ -796,6 +846,10 @@ async fn send_claude_request_stream_once(
         .await?;
 
     let status = response.status();
+    let content_type = response.headers().get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
 
     if !status.is_success() {
         let body = response.text().await?;
@@ -814,6 +868,12 @@ async fn send_claude_request_stream_once(
     let mut token_count = 0u32;
     let mut first_token_received = false;
 
+    // Debug: 检查是否是JSON响应 (有些代理即使在流式模式下出错也会返回JSON)
+    if content_type.contains("application/json") {
+         // 可能是一个非流式的错误响应
+         // 继续读取流，但要注意它可能不是SSE
+    }
+
     while let Some(chunk_result) = byte_stream.next().await {
         match chunk_result {
             Ok(chunk) => {
@@ -824,11 +884,18 @@ async fn send_claude_request_stream_once(
                 if !first_chunk_received {
                     let buffer_str = String::from_utf8_lossy(&buffer);
 
-                    if buffer_str.contains("data: ") &&
-                       !buffer_str.contains("[DONE]") &&
-                       buffer_str.len() > 12 {
+                    if buffer_str.contains("data: ") {
                         ttft = start_time.elapsed();
                         first_chunk_received = true;
+                    } else if buffer.len() > 0 {
+                        // 收到数据但不是SSE格式，打印出来调试
+                        let debug_preview: String = buffer_str.chars().take(200).collect();
+                        println!("⚠️ [Debug] 收到非SSE数据 (Content-Type: {}): {}", content_type, debug_preview);
+                        
+                        // 如果看起来像JSON错误，尝试解析
+                        if debug_preview.trim().starts_with('{') {
+                             return Err(format!("Received JSON instead of SSE: {}", debug_preview).into());
+                        }
                     }
                 }
 
@@ -901,6 +968,7 @@ async fn send_claude_request_non_stream_once(
     url: &str,
     token: &str,
     request: &serde_json::Value,
+    provider: &str,
 ) -> Result<(Duration, Option<TPOTMetrics>, String), Box<dyn std::error::Error + Send + Sync>> {
     let start_time = Instant::now();
 
@@ -908,11 +976,20 @@ async fn send_claude_request_non_stream_once(
         .post(url)
         .header("Content-Type", "application/json");
 
-    // Use Bearer token for non-Azure endpoints
-    if url.contains("openai.azure.com") {
-        req_builder = req_builder.header("api-key", token);
+    if provider == "anthropic" {
+        // New-API 中转通常希望使用 Authorization 头进行鉴权，
+        // 但同时也需要 anthropic-version 头来满足 upstream 的要求。
+        // 我们不再发送 x-api-key，以免 token 被错误地透传给 upstream。
+        req_builder = req_builder
+            .header("Authorization", format!("Bearer {}", token))
+            .header("anthropic-version", "2023-06-01");
     } else {
-        req_builder = req_builder.header("Authorization", format!("Bearer {}", token));
+        // Use Bearer token for non-Azure endpoints
+        if url.contains("openai.azure.com") {
+            req_builder = req_builder.header("api-key", token);
+        } else {
+            req_builder = req_builder.header("Authorization", format!("Bearer {}", token));
+        }
     }
 
     let response = req_builder
