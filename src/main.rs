@@ -67,6 +67,8 @@ struct ClaudeContent {
 struct ClaudeRequest {
     model: String,
     messages: Vec<ClaudeMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system: Option<String>,
     max_tokens: u32,
     temperature: f32,
     stream: bool,
@@ -144,6 +146,14 @@ struct TPOTMetrics {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
 
+    // 检查命令行参数
+    let args: Vec<String> = std::env::args().collect();
+
+    // 如果参数是 "anthropic"，则运行Anthropic直接API测试
+    if args.len() > 1 && args[1] == "anthropic" {
+        return test_anthropic_direct_api().await;
+    }
+
     // 读取API提供商配置
     let provider = std::env::var("PROVIDER")
         .unwrap_or_else(|_| "openai".to_string())
@@ -174,12 +184,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .expect("AZURE_CLAUDE_ENDPOINT not found in .env when PROVIDER=claude");
             let deployment_name = std::env::var("AZURE_CLAUDE_DEPLOYMENT_NAME")
                 .expect("AZURE_CLAUDE_DEPLOYMENT_NAME not found in .env when PROVIDER=claude");
-            let api_version = std::env::var("AZURE_CLAUDE_API_VERSION")
-                .unwrap_or_else(|_| "2025-01-01-preview".to_string());
 
-            // Azure Claude的URL格式: https://your-resource.openai.azure.com/openai/deployments/{deployment-name}/messages?api-version={api-version}
-            let claude_url = format!("{}/openai/deployments/{}/messages?api-version={}",
-                endpoint.trim_end_matches('/'), deployment_name, api_version);
+            // Anthropic原生API格式: 检查endpoint是否已包含/v1/messages
+            let claude_url = if endpoint.ends_with("/v1/messages") {
+                endpoint.to_string()
+            } else {
+                format!("{}/v1/messages", endpoint.trim_end_matches('/'))
+            };
 
             (api_key, claude_url, deployment_name)
         }
@@ -209,7 +220,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse()
         .expect("STREAM must be true or false");
     let prompt = std::env::var("PROMPT")
-        .expect("PROMPT not found in .env");
+        .unwrap_or_else(|_| "Hello, please introduce yourself.".to_string());
 
     println!("API高并发测试开始 ({})", if stream { "含TTFT+TPOT测量" } else { "响应时间测量" });
     println!("提供商: {}", match provider.as_str() {
@@ -242,9 +253,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let token = Arc::new(token);
     let url = Arc::new(url);
 
+    // 调试输出
+    println!("调试信息:");
+    println!("Provider: {}", provider);
+    println!("Token: {}...", &token[..std::cmp::min(10, token.len())]);
+
     // 根据提供商创建不同的请求格式
     let request_data = if provider == "claude" {
-        // Claude v1/messages格式
+        // Claude v1/messages格式 - 修复system角色问题
         let claude_request = ClaudeRequest {
             model: model.clone(),
             messages: vec![
@@ -253,11 +269,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     content: vec![
                         ClaudeContent {
                             r#type: "text".to_string(),
-                            text: format!("{}\n\nhi", prompt),
+                            text: format!("hi\n\n{}", prompt),
                         }
                     ],
                 }
             ],
+            system: Some(prompt), // 使用顶级的system参数而不是system角色的消息
             max_tokens: max_tokens,
             temperature: 0.7,
             stream: stream,
@@ -533,7 +550,8 @@ async fn send_request_stream_once(
 ) -> Result<(Duration, Option<TPOTMetrics>, String), Box<dyn std::error::Error + Send + Sync>> {
     let start_time = Instant::now();
 
-    // 根据URL判断是否为Azure OpenAI，设置不同的认证头
+    // 根据URL判断认证方式
+    let is_anthropic = url.contains("/v1/messages");
     let is_azure = url.contains("openai.azure.com") || url.contains("api-version=");
 
     let mut req_builder = client
@@ -542,7 +560,10 @@ async fn send_request_stream_once(
         .header("Connection", "keep-alive")
         .header("Accept", "text/event-stream");
 
-    if is_azure {
+    if is_anthropic {
+        // 中转平台使用标准OpenAI认证方式：Bearer token
+        req_builder = req_builder.header("Authorization", format!("Bearer {}", token));
+    } else if is_azure {
         req_builder = req_builder.header("api-key", token);
     } else {
         req_builder = req_builder.header("Authorization", format!("Bearer {}", token));
@@ -665,7 +686,8 @@ async fn send_request_non_stream_once(
 ) -> Result<(Duration, Option<TPOTMetrics>, String), Box<dyn std::error::Error + Send + Sync>> {
     let start_time = Instant::now();
 
-    // 根据URL判断是否为Azure OpenAI，设置不同的认证头
+    // 根据URL判断认证方式
+    let is_anthropic = url.contains("/v1/messages");
     let is_azure = url.contains("openai.azure.com") || url.contains("api-version=");
 
     let mut req_builder = client
@@ -673,7 +695,10 @@ async fn send_request_non_stream_once(
         .header("Content-Type", "application/json")
         .header("Connection", "keep-alive");
 
-    if is_azure {
+    if is_anthropic {
+        // 中转平台使用标准OpenAI认证方式：Bearer token
+        req_builder = req_builder.header("Authorization", format!("Bearer {}", token));
+    } else if is_azure {
         req_builder = req_builder.header("api-key", token);
     } else {
         req_builder = req_builder.header("Authorization", format!("Bearer {}", token));
@@ -752,11 +777,19 @@ async fn send_claude_request_stream_once(
 ) -> Result<(Duration, Option<TPOTMetrics>, String), Box<dyn std::error::Error + Send + Sync>> {
     let start_time = Instant::now();
 
-    let response = client
+    let mut req_builder = client
         .post(url)
         .header("Content-Type", "application/json")
-        .header("api-key", token)
-        .header("Accept", "text/event-stream")
+        .header("Accept", "text/event-stream");
+
+    // Use Bearer token for non-Azure endpoints (like New-API or native Anthropic)
+    if url.contains("openai.azure.com") {
+        req_builder = req_builder.header("api-key", token);
+    } else {
+        req_builder = req_builder.header("Authorization", format!("Bearer {}", token));
+    }
+
+    let response = req_builder
         .json(request)
         .timeout(Duration::from_secs(25))
         .send()
@@ -871,10 +904,18 @@ async fn send_claude_request_non_stream_once(
 ) -> Result<(Duration, Option<TPOTMetrics>, String), Box<dyn std::error::Error + Send + Sync>> {
     let start_time = Instant::now();
 
-    let response = client
+    let mut req_builder = client
         .post(url)
-        .header("Content-Type", "application/json")
-        .header("api-key", token)
+        .header("Content-Type", "application/json");
+
+    // Use Bearer token for non-Azure endpoints
+    if url.contains("openai.azure.com") {
+        req_builder = req_builder.header("api-key", token);
+    } else {
+        req_builder = req_builder.header("Authorization", format!("Bearer {}", token));
+    }
+
+    let response = req_builder
         .json(request)
         .timeout(Duration::from_secs(25))
         .send()
@@ -936,4 +977,200 @@ fn extract_claude_message_content(sse_data: &str) -> String {
 
     // 合并所有内容部分
     content_parts.join("")
+}
+
+// 新增：Anthropic直接API测试函数
+async fn test_anthropic_direct_api() -> Result<(), Box<dyn std::error::Error>> {
+    dotenv().ok();
+
+    println!("🔥 开始Anthropic直接API测试");
+
+    // 读取Anthropic API配置
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .expect("ANTHROPIC_API_KEY not found in .env");
+    let model = std::env::var("ANTHROPIC_MODEL")
+        .unwrap_or_else(|_| "claude-3-5-sonnet-20241022".to_string());
+    let max_tokens: u32 = std::env::var("MAX_TOKENS")
+        .unwrap_or_else(|_| "500".to_string())
+        .parse()
+        .expect("MAX_TOKENS must be a number");
+    let stream: bool = std::env::var("STREAM")
+        .unwrap_or_else(|_| "true".to_string())
+        .parse()
+        .expect("STREAM must be true or false");
+    let prompt = std::env::var("PROMPT")
+        .unwrap_or_else(|_| "写一篇300字小说".to_string());
+
+    let url = "https://api.anthropic.com/v1/messages";
+
+    println!("模型: {}", model);
+    println!("最大Token数: {}", max_tokens);
+    println!("流式响应: {}", stream);
+    println!("提示词: {}", prompt);
+
+    // 配置HTTP客户端
+    let client = Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("Failed to create HTTP client");
+
+    // 创建正确的Anthropic API请求
+    let claude_request = ClaudeRequest {
+        model: model.clone(),
+        messages: vec![
+            ClaudeMessage {
+                role: "user".to_string(),
+                content: vec![
+                    ClaudeContent {
+                        r#type: "text".to_string(),
+                        text: format!("hi\n\n{}", prompt),
+                    }
+                ],
+            }
+        ],
+        system: Some(prompt), // 正确使用system参数
+        max_tokens: max_tokens,
+        temperature: 0.7,
+        stream: stream,
+    };
+
+    println!("\n🚀 发送请求到Anthropic API...");
+
+    let result = if stream {
+        send_anthropic_stream_request(&client, url, &api_key, &claude_request).await
+    } else {
+        send_anthropic_non_stream_request(&client, url, &api_key, &claude_request).await
+    };
+
+    match result {
+        Ok((response_time, content)) => {
+            println!("✅ 请求成功!");
+            println!("⏱️  响应时间: {:?}", response_time);
+            println!("📝 回复内容: {}\n", content);
+            println!("🎯 Anthropic API测试完成");
+        }
+        Err(e) => {
+            println!("❌ 请求失败: {}", e);
+            return Err(e);
+        }
+    }
+
+    Ok(())
+}
+
+async fn send_anthropic_stream_request(
+    client: &Client,
+    url: &str,
+    api_key: &str,
+    request: &ClaudeRequest,
+) -> Result<(Duration, String), Box<dyn std::error::Error + Send + Sync>> {
+    let start_time = Instant::now();
+
+    let response = client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("Accept", "text/event-stream")
+        .json(request)
+        .timeout(Duration::from_secs(25))
+        .send()
+        .await?;
+
+    let status = response.status();
+
+    if !status.is_success() {
+        let body = response.text().await?;
+        return Err(format!("HTTP {}: {}", status, body).into());
+    }
+
+    // 处理流式响应
+    let mut byte_stream = response.bytes_stream();
+    let mut complete_response = String::new();
+    let mut content_parts = Vec::new();
+
+    while let Some(chunk_result) = byte_stream.next().await {
+        match chunk_result {
+            Ok(chunk) => {
+                let chunk_str = String::from_utf8_lossy(&chunk);
+                complete_response.push_str(&chunk_str);
+
+                // 解析流式数据
+                let lines: Vec<&str> = chunk_str.lines().collect();
+                for line in lines {
+                    if line.starts_with("data: ") && !line.contains("[DONE]") {
+                        let data_str = &line[6..];
+
+                        if let Ok(claude_stream) = serde_json::from_str::<ClaudeStreamResponse>(data_str) {
+                            if let Some(delta) = claude_stream.delta {
+                                if !delta.text.trim().is_empty() {
+                                    content_parts.push(delta.text.clone());
+                                    print!("{}", delta.text); // 实时输出
+                                    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if complete_response.contains("[DONE]") {
+                    break;
+                }
+            }
+            Err(e) => {
+                return Err(format!("Stream error: {}", e).into());
+            }
+        }
+
+        if start_time.elapsed() > Duration::from_secs(20) {
+            break;
+        }
+    }
+
+    println!(); // 换行
+
+    let response_time = start_time.elapsed();
+    let content = content_parts.join("");
+
+    Ok((response_time, content))
+}
+
+async fn send_anthropic_non_stream_request(
+    client: &Client,
+    url: &str,
+    api_key: &str,
+    request: &ClaudeRequest,
+) -> Result<(Duration, String), Box<dyn std::error::Error + Send + Sync>> {
+    let start_time = Instant::now();
+
+    let response = client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .json(request)
+        .timeout(Duration::from_secs(25))
+        .send()
+        .await?;
+
+    let status = response.status();
+
+    if !status.is_success() {
+        let body = response.text().await?;
+        return Err(format!("HTTP {}: {}", status, body).into());
+    }
+
+    let response_text = response.text().await?;
+    let response_time = start_time.elapsed();
+
+    // 解析响应
+    if let Ok(claude_response) = serde_json::from_str::<ClaudeResponse>(&response_text) {
+        let content: String = claude_response.content
+            .iter()
+            .filter_map(|c| c.text.clone().into())
+            .collect();
+        Ok((response_time, content))
+    } else {
+        Err("Failed to parse Claude response".into())
+    }
 }
